@@ -383,6 +383,15 @@ impl AuthMessage {
         buf.write_ub4(pair.flags);
     }
 
+    /// Returns the server's end-user security context flags
+    /// (`AUTH_CLIENT_EUSC_FLAG`), 0 when absent.
+    pub(crate) fn get_eusc_flags(&self) -> u32 {
+        self.session_data
+            .get("AUTH_CLIENT_EUSC_FLAG")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0)
+    }
+
     /// Returns the domain of the database.
     pub(crate) fn get_db_domain(&self) -> String {
         if let Some(value) = self.session_data.get("AUTH_SC_DB_DOMAIN") {

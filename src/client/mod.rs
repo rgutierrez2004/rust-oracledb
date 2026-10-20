@@ -73,6 +73,9 @@ use capabilities::Capabilities;
 
 const TTC_SECURITY_CONTEXT_ATTACH_FLAG: u32 = 0x01;
 const TTC_END_USER_SECURITY_CONTEXT_KEY: &str = "ORCL_XS_AUTHZ_CONTEXT";
+const TTC_END_USER_SECURITY_CONTEXT_HASH_KEY: &str = "ORCL_XS_AUTH_HASH";
+/// `AUTH_CLIENT_EUSC_FLAG` bit: server accepts the context hash.
+const EUSC_HASH_SUPPORTED: u32 = 0x01;
 
 pub struct Client {
     transport: Transport,
@@ -98,6 +101,10 @@ pub struct Client {
     pool_id: String,
     last_warning: Option<String>,
     security_context: Option<EndUserSecurityContext>,
+    /// Send the complete context payload on the next round trip (first
+    /// send after set/clear/end of request); afterwards only the hash (and
+    /// the attributes) are re-sent when the server supports it.
+    send_full_security_context: bool,
     temp_lobs_to_close: Vec<Vec<u8>>,
 }
 
@@ -478,27 +485,58 @@ impl Client {
     }
 
     /// Writes the Deep Data Security context piggyback expected by the TTC
-    /// protocol.
+    /// protocol. Mirrors python-oracledb: the first round trip carries the
+    /// full payload (plus its hash when the server supports hashes); later
+    /// round trips carry only the hash and, if present, the attributes.
     fn write_piggyback_end_user_security_context(
-        &self,
+        &mut self,
         buf: &mut WriteBuffer,
-        context: &EndUserSecurityContext,
     ) {
-        let oson_bytes = context.oson_bytes();
+        let Some(context) = self.security_context.as_ref() else {
+            return;
+        };
+        let hash_text = if self.caps.supports_end_user_security_context_hash()
+        {
+            context.hash_value()
+        } else {
+            None
+        };
+        let context_bytes =
+            if hash_text.is_none() || self.send_full_security_context {
+                Some(context.oson_bytes())
+            } else {
+                context.partial_oson_bytes()
+            };
+        let num_pairs: u32 = if hash_text.is_some() && context_bytes.is_some()
+        {
+            2
+        } else {
+            1
+        };
         buf.write_piggyback_header(
             self,
             constants::TTC_RPC_END_USER_SECURITY_CONTEXT,
         );
         buf.write_ub4(TTC_SECURITY_CONTEXT_ATTACH_FLAG);
         buf.write_u8(1); // pointer
-        buf.write_ub4(1); // number of key/value pairs
-
-        buf.write_ub4(0); // flags
-        buf.write_bytes_with_double_length(Some(
-            TTC_END_USER_SECURITY_CONTEXT_KEY.as_bytes(),
-        ));
-        buf.write_bytes_with_double_length(None); // text
-        buf.write_bytes_with_double_length(Some(&oson_bytes));
+        buf.write_ub4(num_pairs); // number of key/value pairs
+        if let Some(bytes) = context_bytes.as_deref() {
+            buf.write_ub4(0); // flags
+            buf.write_bytes_with_double_length(Some(
+                TTC_END_USER_SECURITY_CONTEXT_KEY.as_bytes(),
+            ));
+            buf.write_bytes_with_double_length(None); // text
+            buf.write_bytes_with_double_length(Some(bytes));
+        }
+        if let Some(hash) = hash_text {
+            self.send_full_security_context = false;
+            buf.write_ub4(0); // flags
+            buf.write_bytes_with_double_length(Some(
+                TTC_END_USER_SECURITY_CONTEXT_HASH_KEY.as_bytes(),
+            ));
+            buf.write_bytes_with_double_length(Some(hash.as_bytes())); // text
+            buf.write_bytes_with_double_length(None);
+        }
     }
 
     /// Writes the session state piggyback. This is used to let the database
@@ -514,8 +552,8 @@ impl Client {
 
     /// Writes all of the piggybacks for the given round trip.
     fn write_piggybacks(&mut self, buf: &mut WriteBuffer) {
-        if let Some(context) = self.security_context.as_ref() {
-            self.write_piggyback_end_user_security_context(buf, context);
+        if self.security_context.is_some() {
+            self.write_piggyback_end_user_security_context(buf);
         }
         if self.statement_cache.has_cursors_to_close()
             && !self.drcp_establish_session
@@ -594,6 +632,7 @@ impl Client {
     /// Removes any Deep Data Security context stored on this client/session.
     pub(crate) fn clear_end_user_security_context(&mut self) {
         self.security_context = None;
+        self.send_full_security_context = true;
     }
 
     /// Closes the connection to the database.
@@ -732,6 +771,7 @@ impl Client {
     /// releases any session to the DRCP pool, if applicable.
     pub(crate) fn end_request(&mut self) -> Result<(), Error> {
         self.security_context = None;
+        self.send_full_security_context = true;
         self.last_warning = None;
         self.transport.set_read_timeout(None)?;
         if self.in_request {
@@ -920,6 +960,7 @@ impl Client {
             pending_session_state: 0,
             last_warning: None,
             security_context: None,
+            send_full_security_context: true,
             transaction_in_progress: false,
             pool_id,
             temp_lobs_to_close: Vec::new(),
@@ -934,6 +975,9 @@ impl Client {
     ) -> Result<DbInfo, Error> {
         let db_info = DbInfo::new(self, auth_message);
         self.combo_key = auth_message.take_combo_key();
+        self.caps.set_end_user_security_context_hash(
+            auth_message.get_eusc_flags() & EUSC_HASH_SUPPORTED != 0,
+        );
         let max_open_cursors = db_info.get_max_open_cursors();
         if max_open_cursors < self.statement_cache.max_size() {
             self.statement_cache.resize(max_open_cursors);
@@ -1017,6 +1061,7 @@ impl Client {
             return Err(Error::unsupported_deep_data_security_feature());
         }
         self.security_context = Some(context);
+        self.send_full_security_context = true;
         Ok(())
     }
 

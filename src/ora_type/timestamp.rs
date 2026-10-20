@@ -231,10 +231,13 @@ impl FromBuf for OracleTimestamp {
         if buf.len() == constants::ORA_TYPE_SIZE_TIMESTAMP_TZ
             && buf[11] != 0
             && buf[12] != 0
+            // high bit set: the two bytes carry a time zone *region id*
+            // (e.g. "UTC", "America/New_York") instead of an offset. The
+            // date/time components are always stored in UTC, so the value
+            // is returned with a zero offset; the region name is not
+            // preserved. (python-oracledb raises DPY-3022 in this case.)
+            && buf[11] & 0x80 == 0
         {
-            if buf[11] & 0x80 != 0 {
-                todo!();
-            }
             tz_hour_offset =
                 buf[11].wrapping_sub(constants::TZ_HOUR_OFFSET) as i8;
 

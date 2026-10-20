@@ -34,6 +34,9 @@
 
 use std::collections::HashMap;
 
+use base64ct::Encoding;
+use sha2::Digest;
+
 use crate::error::Error;
 use crate::json::{JsonValue, encode_oson};
 use crate::secret_value::SecretValue;
@@ -84,7 +87,15 @@ impl EndUserIdentity {
 /// Validated, pre-serialized Deep Data Security payload.
 #[derive(Clone)]
 pub struct EndUserSecurityContext {
+    /// Full payload (identity, database access token, roles, attributes).
     oson_bytes: SecretValue,
+    /// Attributes-only payload, re-sent with the hash on later round trips
+    /// (token identities only).
+    partial_oson_bytes: Option<SecretValue>,
+    /// base64(SHA-256(end_user_token + database_access_token + sorted
+    /// "len:role" list)) — lets the server identify an already established
+    /// context without receiving the tokens again (token identities only).
+    hash_value: Option<SecretValue>,
 }
 
 /// Builder used to add optional data roles and attributes before encoding.
@@ -99,6 +110,18 @@ impl EndUserSecurityContext {
     /// Returns the raw OSON payload for the protocol layer.
     pub(crate) fn oson_bytes(&self) -> Vec<u8> {
         self.oson_bytes.get_value()
+    }
+
+    /// Returns the attributes-only OSON payload, if any.
+    pub(crate) fn partial_oson_bytes(&self) -> Option<Vec<u8>> {
+        self.partial_oson_bytes.as_ref().map(|v| v.get_value())
+    }
+
+    /// Returns the context hash (text), if the identity is a token.
+    pub(crate) fn hash_value(&self) -> Option<String> {
+        self.hash_value
+            .as_ref()
+            .map(|v| String::from_utf8_lossy(&v.get_value()).into_owned())
     }
 
     /// Creates a builder for a Deep Data Security context with optional roles
@@ -150,11 +173,14 @@ impl EndUserSecurityContextBuilder {
         self.validate()?;
 
         let mut payload = HashMap::new();
+        let mut hash_parts = String::new();
+        let is_token = matches!(self.identity, EndUserIdentity::Token(_));
         payload
             .insert("ver".to_string(), JsonValue::String("1.0".to_string()));
 
         match self.identity {
             EndUserIdentity::Token(token) => {
+                hash_parts.push_str(&token);
                 payload.insert(
                     "end_user_token".to_string(),
                     JsonValue::String(token),
@@ -174,12 +200,18 @@ impl EndUserSecurityContextBuilder {
             }
         }
 
+        hash_parts.push_str(&self.database_access_token);
         payload.insert(
             "database_access_token".to_string(),
             JsonValue::String(self.database_access_token),
         );
 
         if let Some(data_roles) = self.data_roles {
+            let mut sorted = data_roles.clone();
+            sorted.sort();
+            for role in &sorted {
+                hash_parts.push_str(&format!("{}:{}", role.len(), role));
+            }
             payload.insert(
                 "data_roles".to_string(),
                 JsonValue::JsonArray(
@@ -188,6 +220,7 @@ impl EndUserSecurityContextBuilder {
             );
         }
 
+        let mut partial_payload = None;
         if let Some(attributes) = self.attributes {
             let attributes = attributes
                 .into_iter()
@@ -199,7 +232,15 @@ impl EndUserSecurityContextBuilder {
                     JsonValue::JsonObject(attribute)
                 })
                 .collect::<Vec<JsonValue>>();
-
+            if is_token {
+                let mut partial = HashMap::new();
+                partial.insert(
+                    "attributes".to_string(),
+                    JsonValue::JsonArray(attributes.clone()),
+                );
+                partial_payload =
+                    Some(encode_oson(&JsonValue::JsonObject(partial)));
+            }
             payload.insert(
                 "attributes".to_string(),
                 JsonValue::JsonArray(attributes),
@@ -213,8 +254,19 @@ impl EndUserSecurityContextBuilder {
             ));
         }
 
+        let hash_value = is_token.then(|| {
+            let digest = sha2::Sha256::digest(hash_parts.as_bytes());
+            SecretValue::new(
+                base64ct::Base64::encode_string(&digest).as_bytes(),
+            )
+        });
+
         Ok(EndUserSecurityContext {
             oson_bytes: SecretValue::new(&oson_bytes),
+            partial_oson_bytes: partial_payload
+                .as_deref()
+                .map(SecretValue::new),
+            hash_value,
         })
     }
 

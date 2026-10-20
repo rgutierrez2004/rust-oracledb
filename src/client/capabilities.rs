@@ -101,6 +101,7 @@ const CCAP_VAL_TOKEN_SUPPORTED: u8 = 0x02;
 const CCAP_VAL_PIPELINING_SUPPORT: u8 = 0x04;
 const CCAP_VAL_PIPELINING_BREAK: u8 = 0x10;
 const CCAP_VAL_END_USER_SEC_CTX_PIGGYBACK: u8 = 0x02;
+const CCAP_VAL_END_USER_SEC_CTX_PIGGYBACK_HASH: u8 = 0x20;
 const CCAP_VAL_VECTOR_FEATURE_BINARY: u8 = 0x01;
 const CCAP_VAL_VECTOR_FEATURE_SPARSE: u8 = 0x02;
 const CCAP_VAL_TTC6_HA_READINESS: u8 = 0x04;
@@ -130,6 +131,7 @@ pub struct Capabilities {
     supports_pipelining: bool,
     supports_request_boundaries: bool,
     supports_end_user_security_context: bool,
+    supports_end_user_security_context_hash: bool,
     supports_ha_readiness: bool,
 }
 
@@ -234,7 +236,8 @@ impl Capabilities {
         self.compile_caps[CCAP_IX_VECTOR_FEATURES] =
             CCAP_VAL_VECTOR_FEATURE_BINARY | CCAP_VAL_VECTOR_FEATURE_SPARSE;
         self.compile_caps[CCAP_IX_FEATURE_BACKPORT2] =
-            CCAP_VAL_END_USER_SEC_CTX_PIGGYBACK;
+            CCAP_VAL_END_USER_SEC_CTX_PIGGYBACK
+                | CCAP_VAL_END_USER_SEC_CTX_PIGGYBACK_HASH;
         self.compile_caps[CCAP_IX_TTC6] = CCAP_VAL_TTC6_HA_READINESS;
     }
 
@@ -261,6 +264,7 @@ impl Capabilities {
             supports_pipelining: false,
             supports_request_boundaries: false,
             supports_end_user_security_context: false,
+            supports_end_user_security_context_hash: false,
             supports_ha_readiness: false,
         };
         caps.init_compile_caps();
@@ -286,6 +290,18 @@ impl Capabilities {
     /// piggybacking.
     pub fn supports_end_user_security_context(&self) -> bool {
         self.supports_end_user_security_context
+    }
+
+    /// Returns whether the server accepts the context hash
+    /// (`ORCL_XS_AUTH_HASH`) in place of the full payload on round trips
+    /// after the first one (`AUTH_CLIENT_EUSC_FLAG` bit 0x01 at logon).
+    pub fn supports_end_user_security_context_hash(&self) -> bool {
+        self.supports_end_user_security_context_hash
+    }
+
+    /// Records the server's end-user security context flags from logon.
+    pub(crate) fn set_end_user_security_context_hash(&mut self, value: bool) {
+        self.supports_end_user_security_context_hash = value;
     }
 
     pub fn supports_fast_auth(&self) -> bool {
