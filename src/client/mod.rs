@@ -244,10 +244,20 @@ impl Client {
         }
     }
 
-    /// Sends a marker packet of the specified type to the database.
+    /// Sends a marker packet of the specified type to the database. Marker
+    /// packets carry no piggybacks: a pending piggyback (such as a Deep Data
+    /// Security context) written ahead of the marker would make the packet
+    /// unrecognisable to the server, which then never answers the reset.
     fn send_marker(&mut self, marker_type: u8) -> Result<(), Error> {
-        let mut message = MarkerMessage::new(marker_type);
-        self.send_message(&mut message)
+        let message = MarkerMessage::new(marker_type);
+        let mut buf = WriteBuffer::new();
+        message.serialize(self, &mut buf);
+        self.transport.send_packets(
+            message.get_packet_type(),
+            message.get_packet_flags(),
+            message.get_data_flags(),
+            buf.get_buf(),
+        )
     }
 
     /// Sends a message to the database.
