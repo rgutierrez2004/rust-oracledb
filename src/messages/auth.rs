@@ -92,6 +92,9 @@ pub struct AuthMessage {
     pairs: Vec<Pair>,
     combo_key: Option<[u8; 32]>,
     resend_needed: bool,
+    /// Access token for external authentication; when present, phase one is
+    /// skipped and the token is sent in place of the password verifier.
+    token: Option<String>,
 }
 
 impl AuthMessage {
@@ -276,10 +279,43 @@ impl AuthMessage {
         format!("ALTER SESSION SET TIME_ZONE={}\0", tz_repr)
     }
 
+    /// Adds the key/value pairs describing the client session that are sent
+    /// during phase two of authentication.
+    fn add_session_pairs(&mut self, client: &Client) {
+        self.add_pair(
+            "SESSION_CLIENT_CHARSET",
+            &constants::CHARSET_ID_UTF8.to_string(),
+            0,
+        );
+        self.add_pair(
+            "SESSION_CLIENT_DRIVER_NAME",
+            client.config().driver_name(),
+            0,
+        );
+        let major = env!("CARGO_PKG_VERSION_MAJOR").parse::<usize>().unwrap();
+        let minor = env!("CARGO_PKG_VERSION_MINOR").parse::<usize>().unwrap();
+        let patch = env!("CARGO_PKG_VERSION_PATCH").parse::<usize>().unwrap();
+        let full_version_num = major << 24 | minor << 20 | patch << 12;
+        self.add_pair(
+            "SESSION_CLIENT_VERSION",
+            &full_version_num.to_string(),
+            0,
+        );
+        self.add_pair(
+            "AUTH_ALTER_SESSION",
+            &self.get_alter_session_statement(),
+            1,
+        );
+        if let Some(cclass) = client.config().cclass() {
+            self.add_pair("AUTH_KPPL_CONN_CLASS", cclass, 0);
+        }
+    }
+
     /// Returns the authorization mode to use when performing authentication.
     fn get_auth_mode(&self, client: &Client) -> u32 {
         let mut auth_mode: u32 = 0;
-        if self.get_is_phase_one() {
+        if self.get_is_phase_one() || self.token.is_some() {
+            // external (token) authentication never sends a password
             auth_mode |= constants::TTC_AUTH_MODE_LOGON;
         } else {
             auth_mode |= constants::TTC_AUTH_MODE_WITH_PASSWORD;
@@ -315,9 +351,13 @@ impl AuthMessage {
     }
 
     /// Returns whether phase one authorization is taking place or phase two
-    /// authorization. Phase one is only used on logon.
+    /// authorization. Phase one is only used on logon with a password; with
+    /// external (token) authentication the database has no password verifier
+    /// to return, so only phase two is used.
     fn get_is_phase_one(&self) -> bool {
-        self.combo_key.is_none() && self.session_data.is_empty()
+        self.token.is_none()
+            && self.combo_key.is_none()
+            && self.session_data.is_empty()
     }
 
     /// Returns the TTC meessage type to use when sending the request to the
@@ -452,6 +492,7 @@ impl AuthMessage {
             pairs: Vec::<Pair>::new(),
             combo_key: None,
             resend_needed: false,
+            token: None,
         }
     }
 
@@ -485,7 +526,16 @@ impl Message for AuthMessage {
 
     fn pre_process(&mut self, client: &mut Client) {
         self.pairs.clear();
-        if self.get_is_phase_one() {
+        if self.combo_key.is_none() {
+            self.token = client.config().get_access_token();
+        }
+        if let Some(token) = self.token.clone() {
+            // external authentication: the token replaces AUTH_SESSKEY,
+            // AUTH_PBKDF2_SPEEDY_KEY and AUTH_PASSWORD; only phase two is sent
+            self.add_pair("AUTH_TOKEN", &token, 0);
+            self.add_session_pairs(client);
+            self.resend_needed = false;
+        } else if self.get_is_phase_one() {
             self.add_pair("AUTH_TERMINAL", client.config().terminal(), 0);
             self.add_pair("AUTH_PROGRAM_NM", client.config().program(), 0);
             self.add_pair("AUTH_MACHINE", client.config().machine(), 0);
@@ -496,36 +546,7 @@ impl Message for AuthMessage {
             self.encrypt_passwords(client, &combo_key);
         } else {
             self.generate_verifier(client);
-            self.add_pair(
-                "SESSION_CLIENT_CHARSET",
-                &constants::CHARSET_ID_UTF8.to_string(),
-                0,
-            );
-            self.add_pair(
-                "SESSION_CLIENT_DRIVER_NAME",
-                client.config().driver_name(),
-                0,
-            );
-            let major =
-                env!("CARGO_PKG_VERSION_MAJOR").parse::<usize>().unwrap();
-            let minor =
-                env!("CARGO_PKG_VERSION_MINOR").parse::<usize>().unwrap();
-            let patch =
-                env!("CARGO_PKG_VERSION_PATCH").parse::<usize>().unwrap();
-            let full_version_num = major << 24 | minor << 20 | patch << 12;
-            self.add_pair(
-                "SESSION_CLIENT_VERSION",
-                &full_version_num.to_string(),
-                0,
-            );
-            self.add_pair(
-                "AUTH_ALTER_SESSION",
-                &self.get_alter_session_statement(),
-                1,
-            );
-            if let Some(cclass) = client.config().cclass() {
-                self.add_pair("AUTH_KPPL_CONN_CLASS", cclass, 0);
-            }
+            self.add_session_pairs(client);
             self.resend_needed = false;
         }
     }
@@ -536,15 +557,20 @@ impl Message for AuthMessage {
 
     fn serialize(&self, client: &Client, buf: &mut WriteBuffer) {
         buf.write_function_header(client, self.get_ttc_message_type());
-        let user_bytes = client.config().user().unwrap().as_bytes();
-        buf.write_u8(1); // pointer (user)
+        // with external authentication there is no user name: a zero pointer
+        // and zero length are sent instead
+        let user_bytes = client.config().user().unwrap_or("").as_bytes();
+        let has_user: u8 = if user_bytes.is_empty() { 0 } else { 1 };
+        buf.write_u8(has_user); // pointer (user)
         buf.write_ub4(user_bytes.len().try_into().unwrap());
         buf.write_ub4(self.get_auth_mode(client));
         buf.write_u8(1); // pointer (authivl)
         buf.write_ub4(self.pairs.len().try_into().unwrap());
         buf.write_u8(1); // pointer (authovl)
         buf.write_u8(1); // pointer (authovln)
-        buf.write_bytes_with_length(user_bytes);
+        if has_user == 1 {
+            buf.write_bytes_with_length(user_bytes);
+        }
         for pair in self.pairs.iter() {
             self.write_pair(buf, pair);
         }

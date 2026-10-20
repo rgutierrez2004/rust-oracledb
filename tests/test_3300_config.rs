@@ -262,3 +262,50 @@ fn test_3304() {
         )
     ));
 }
+
+#[test]
+/// Verifies that external (access token) authentication requires the tcps
+/// protocol and removes the need for a user name and password. Both checks
+/// take place in configuration validation, before any socket is opened.
+fn test_3305() {
+    // no credentials and no external auth -> NoCredentials
+    let config = oracledb::Config::default()
+        .set_connect_string("tcps://host_3305:2484/service_3305")
+        .unwrap();
+    assert!(matches!(
+        oracledb::connect(config),
+        Err(error) if matches!(error.kind(), oracledb::ErrorKind::NoCredentials)
+    ));
+
+    // external auth over tcp -> ExternalAuthRequiresTcps
+    let config = oracledb::Config::default()
+        .set_external_auth(oracledb::ExternalAuth::AccessToken(
+            "token_3305".to_string(),
+        ))
+        .set_connect_string("tcp://host_3305:1521/service_3305")
+        .unwrap();
+    assert!(matches!(
+        oracledb::connect(config),
+        Err(error) if matches!(
+            error.kind(),
+            oracledb::ErrorKind::ExternalAuthRequiresTcps
+        )
+    ));
+
+    // external auth over tcps without credentials passes validation (the
+    // connection attempt itself fails later with a network error here)
+    let config = oracledb::Config::default()
+        .set_external_auth(oracledb::ExternalAuth::AccessToken(
+            "token_3305".to_string(),
+        ))
+        .set_connect_string("tcps://localhost:1/service_3305")
+        .unwrap();
+    assert!(matches!(
+        oracledb::connect(config),
+        Err(error) if !matches!(
+            error.kind(),
+            oracledb::ErrorKind::NoCredentials
+                | oracledb::ErrorKind::ExternalAuthRequiresTcps
+        )
+    ));
+}

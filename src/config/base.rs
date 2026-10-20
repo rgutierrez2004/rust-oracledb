@@ -37,6 +37,7 @@ use super::connect_string_parser;
 use super::defaults;
 
 use crate::error::Error;
+use crate::external_auth::ExternalAuth;
 use crate::secret_value::SecretValue;
 
 /// Represents configuration used to establish a standalone connection to the
@@ -46,6 +47,7 @@ pub struct Config {
     user: Option<String>,
     password: Option<SecretValue>,
     new_password: Option<SecretValue>,
+    access_token: Option<SecretValue>,
     config_dir: Option<String>,
     description_list: Option<DescriptionList>,
     stmtcachesize: Option<usize>,
@@ -62,6 +64,20 @@ pub struct Config {
 }
 
 impl Config {
+    /// Returns the access token to use for external authentication, if one
+    /// was configured.
+    pub(crate) fn get_access_token(&self) -> Option<String> {
+        self.access_token
+            .as_ref()
+            .map(|s| String::from_utf8_lossy(&s.get_value()).into_owned())
+    }
+
+    /// Returns whether external authentication (no user name and password)
+    /// is in use.
+    pub(crate) fn uses_external_auth(&self) -> bool {
+        self.access_token.is_some()
+    }
+
     /// Returns the new password to use, if one was configured.
     pub(crate) fn get_new_password_bytes(&self) -> Option<Vec<u8>> {
         self.new_password.as_ref().map(|s| s.get_value())
@@ -88,13 +104,18 @@ impl Config {
 
     /// Validates the configuration.
     pub(crate) fn validate(&self) -> Result<(), Error> {
-        if self.user.is_none() || self.password.is_none() {
-            Err(Error::no_credentials())
-        } else if self.description_list.is_none() {
-            Err(Error::no_connect_string())
-        } else {
-            Ok(())
+        if !self.uses_external_auth()
+            && (self.user.is_none() || self.password.is_none())
+        {
+            return Err(Error::no_credentials());
         }
+        let Some(description_list) = self.description_list.as_ref() else {
+            return Err(Error::no_connect_string());
+        };
+        if self.uses_external_auth() && !description_list.uses_tcps_only() {
+            return Err(Error::external_auth_requires_tcps());
+        }
+        Ok(())
     }
 
     /// Returns the authorization mode associated with the configuration.
@@ -199,6 +220,18 @@ impl Config {
         connect_string_parser::validate_network_name(&machine)?;
         self.machine = Some(machine);
         Ok(self)
+    }
+
+    /// Sets the method used to authenticate to the database without a user
+    /// name and password. The tcps protocol is required; connecting over any
+    /// other protocol fails with `ErrorKind::ExternalAuthRequiresTcps`.
+    pub fn set_external_auth(mut self, value: ExternalAuth) -> Self {
+        match value {
+            ExternalAuth::AccessToken(token) => {
+                self.access_token = Some(SecretValue::new(token.as_bytes()));
+            }
+        }
+        self
     }
 
     /// Sets the new password to use when connecting to the database.
@@ -330,6 +363,7 @@ impl Default for Config {
             user: None,
             password: None,
             new_password: None,
+            access_token: None,
             config_dir: defaults::default_config_dir().clone(),
             description_list: None,
             stmtcachesize: None,

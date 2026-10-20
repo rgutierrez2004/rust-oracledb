@@ -568,8 +568,14 @@ impl Client {
             .set_password(old_password)
             .set_new_password(new_password);
         mem::swap(&mut temp_config, &mut self.config);
+        // a session authenticated externally (access token) has no combo
+        // key and therefore cannot change a password
+        let Some(combo_key) = self.combo_key else {
+            mem::swap(&mut temp_config, &mut self.config);
+            return Err(Error::no_credentials());
+        };
         let mut auth_message = AuthMessage::new();
-        auth_message.set_combo_key(&self.combo_key.unwrap());
+        auth_message.set_combo_key(&combo_key);
         let result = self.process_message(&mut auth_message);
         mem::swap(&mut temp_config, &mut self.config);
         result.map(|_| ())

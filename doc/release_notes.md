@@ -10,6 +10,10 @@
 1.  Added support for getting the domain and any annotations from columns that
     support them
     ([issue 48](https://github.com/oracle/rust-oracledb/issues/48)).
+1.  Added support for external authentication with an OAuth 2.0 access token
+    (OCI IAM, Microsoft Entra ID) via `Config::set_external_auth()`; requires
+    the tcps protocol
+    ([issue 3](https://github.com/oracle/rust-oracledb/issues/3)).
 1.  Fixed bug causing bind variables to be detected within DDL statements
     ([issue 33](https://github.com/oracle/rust-oracledb/issues/33)).
 1.  Fixed issue with encoding integers with trailing zeros

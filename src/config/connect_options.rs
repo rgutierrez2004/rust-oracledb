@@ -641,6 +641,17 @@ impl Description {
         self.sid.as_deref().unwrap_or("")
     }
 
+    /// Returns whether every address in the description uses the TCPS
+    /// protocol.
+    pub(crate) fn uses_tcps_only(&self) -> bool {
+        self.address_lists.iter().all(|address_list| {
+            address_list
+                .addresses
+                .iter()
+                .all(|address| address.protocol() == "tcps")
+        })
+    }
+
     /// Validates the description.
     pub(crate) fn validate(&self, connect_string: &str) -> Result<(), Error> {
         if self.address_lists.is_empty() {
@@ -698,6 +709,14 @@ impl DescriptionList {
     /// Returns whether source routing should be used.
     fn source_route(&self) -> bool {
         self.source_route.unwrap_or(false)
+    }
+
+    /// Returns whether every address in every description uses the TCPS
+    /// protocol (required for external authentication).
+    pub(crate) fn uses_tcps_only(&self) -> bool {
+        self.descriptions
+            .iter()
+            .all(|description| description.uses_tcps_only())
     }
 
     /// Builds the DESCRRIPTION_LIST segment of a full descriptor.
