@@ -176,7 +176,9 @@ pub(crate) struct Transport {
 #[derive(Debug)]
 struct CustomClientCertResolver {
     key: Option<Arc<CertifiedKey>>,
-    root_store: Option<rustls::RootCertStore>,
+    /// Certificates from a wallet without a private key: additional trust
+    /// anchors for the server certificate (private CA / self-signed server).
+    extra_roots: Vec<CertificateDer<'static>>,
 }
 
 // how many bytes should be included for each line of packet output
@@ -493,18 +495,43 @@ impl CustomClientCertResolver {
     fn new() -> Self {
         Self {
             key: None,
-            root_store: Some(rustls::RootCertStore {
-                roots: webpki_roots::TLS_SERVER_ROOTS.into(),
-            }),
+            extra_roots: Vec::new(),
         }
     }
 
     /// Returns the TLS configuration to use when connecting to the database.
+    ///
+    /// Server certificates are verified against the operating system's trust
+    /// store (Windows certificate store, macOS Security framework, the
+    /// system CA bundle on Linux/BSD) augmented with the wallet's
+    /// certificates, so a server certificate issued by a public or corporate
+    /// CA installed on the machine needs no wallet — the same behaviour as
+    /// JDBC thin with the JDK trust store. When no platform store can be
+    /// loaded, the bundled Mozilla roots are used instead.
     fn get_tls_config(mut self) -> TlsClientConfig {
-        let root_store = self.root_store.take().unwrap();
-        TlsClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_client_cert_resolver(Arc::new(self))
+        let extra_roots = std::mem::take(&mut self.extra_roots);
+        let builder = TlsClientConfig::builder();
+        let provider = builder.crypto_provider().clone();
+        match rustls_platform_verifier::Verifier::new_with_extra_roots(
+            extra_roots.iter().cloned(),
+            provider,
+        ) {
+            Ok(verifier) => builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(verifier))
+                .with_client_cert_resolver(Arc::new(self)),
+            Err(_) => {
+                let mut root_store = rustls::RootCertStore {
+                    roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+                };
+                for cert in extra_roots {
+                    let _ = root_store.add(cert);
+                }
+                TlsClientConfig::builder()
+                    .with_root_certificates(root_store)
+                    .with_client_cert_resolver(Arc::new(self))
+            }
+        }
     }
 
     /// Populates the certified key with the contents of the wallet defined in
@@ -574,11 +601,7 @@ impl CustomClientCertResolver {
             let signing_key = provider.key_provider.load_private_key(key)?;
             self.key = Some(Arc::new(CertifiedKey::new(certs, signing_key)));
         } else {
-            let root_store: &mut rustls::RootCertStore =
-                self.root_store.as_mut().unwrap();
-            for cert in &certs {
-                root_store.add(cert.clone())?;
-            }
+            self.extra_roots = certs;
         }
 
         Ok(())
